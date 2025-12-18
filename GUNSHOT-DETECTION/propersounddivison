@@ -1,0 +1,173 @@
+%% 1. Setup & Robust Data Loading
+
+% UPDATE THIS PATH to your folder containing 'Gunshot' and 'NonGunshot' subfolders
+dataFolder = 'Data'; 
+
+% Create Datastore
+ads = audioDatastore(dataFolder, 'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+
+% --- CRITICAL FIX: BALANCE DATA FIRST ---
+% 1. Count how many files are in each category
+counts = countEachLabel(ads);
+disp('Original Dataset Counts:');
+disp(counts);
+
+% 2. Find the smallest category (likely Gunshot)
+minCount = min(counts.Count);
+fprintf('Balancing dataset to %d files per category...\n', minCount);
+
+% 3. Create a perfectly balanced subset
+% This throws away excess NonGunshot files so the model isn't biased
+adsBalanced = splitEachLabel(ads, minCount, 'randomized');
+
+% 4. Verify Balance
+newCounts = countEachLabel(adsBalanced);
+if range(newCounts.Count) > 0
+    error('STOP! The dataset is still not balanced. Check your folders.');
+else
+    disp('Success! Data is perfectly balanced (50/50).');
+end
+
+% 5. NOW split into Train (80%) and Test (20%)
+[trainDatastore, testDatastore] = splitEachLabel(adsBalanced, 0.8, 'randomized');
+
+disp('Training Set Size:');
+disp(countEachLabel(trainDatastore));
+disp('Test Set Size:');
+disp(countEachLabel(testDatastore));
+
+%% 2. Define Feature Extraction (Matched to Simulink)
+fs = 44100;
+windowLength = 1024;
+overlapLength = 512;
+
+% NOTE: Switched to 'hamming' to match your Simulink Block default
+afe = audioFeatureExtractor('SampleRate', fs, ...
+    'Window', hamming(windowLength, 'periodic'), ...
+    'OverlapLength', overlapLength, ...
+    'mfcc', true);
+
+% Match Simulink "Append Delta" = ON, "Append DeltaDelta" = OFF
+afe.mfccDelta = true; 
+afe.mfccDeltaDelta = false;
+
+%% 3. Extract Features (Training Set) with Peak Detection
+disp('Extracting features from Training Set...');
+trainFeatures = [];
+trainLabels = [];
+
+% Define Target Duration (2 Seconds)
+targetDuration = 2; 
+targetSamples = targetDuration * fs;
+
+reset(trainDatastore);
+while hasdata(trainDatastore)
+    [audioIn, info] = read(trainDatastore);
+    
+    % 1. Force Mono
+    if size(audioIn, 2) > 1
+        audioIn = mean(audioIn, 2); 
+    end 
+    
+    % 2. CRITICAL FIX: Extract 2s around the Peak
+    N = length(audioIn);
+    
+    if N > targetSamples
+        % Find the index of the loudest point (Peak Amplitude)
+        [~, peakIdx] = max(abs(audioIn));
+        
+        % Calculate Start and End to center the window on the peak
+        halfWin = floor(targetSamples / 2);
+        startIdx = peakIdx - halfWin;
+        endIdx = startIdx + targetSamples - 1;
+        
+        % Handle Edge Cases (If peak is at the very start or end)
+        if startIdx < 1
+            startIdx = 1;
+            endIdx = targetSamples;
+        elseif endIdx > N
+            endIdx = N;
+            startIdx = N - targetSamples + 1;
+        end
+        
+        % Extract the snippet
+        audioIn = audioIn(startIdx:endIdx);
+    end
+    % (If file is shorter than 2s, we keep the whole thing as is)
+    
+    % 3. Extract Features
+    features = extract(afe, audioIn);
+    
+    % 4. Stack
+    trainFeatures = [trainFeatures; features];
+    
+    % Replicate label for every frame in this file
+    numFrames = size(features, 1);
+    trainLabels = [trainLabels; repmat(info.Label, numFrames, 1)];
+end
+
+%% 4. Train Model (Ensemble/XGBoost)
+disp('Training Model...');
+
+% Using 'Bag' (Bagged Trees) is often more stable for this than pure XGBoost
+t = templateTree('MaxNumSplits', 50); % Increased splits for better accuracy
+trainedModel = fitcensemble(trainFeatures, trainLabels, ...
+    'Method', 'Bag', ...
+    'NumLearningCycles', 50, ...
+    'Learners', t);
+
+%% 5. Testing & Validation
+disp('Testing Model...');
+testFeatures = [];
+testLabels = [];
+
+reset(testDatastore);
+while hasdata(testDatastore)
+    [audioIn, info] = read(testDatastore);
+    
+    % 1. Force Mono
+    if size(audioIn, 2) > 1
+        audioIn = mean(audioIn, 2); 
+    end
+    
+    % 2. CRITICAL FIX: Extract 2s around the Peak (Same as Training)
+    N = length(audioIn);
+    
+    if N > targetSamples
+        [~, peakIdx] = max(abs(audioIn));
+        halfWin = floor(targetSamples / 2);
+        startIdx = peakIdx - halfWin;
+        endIdx = startIdx + targetSamples - 1;
+        
+        if startIdx < 1
+            startIdx = 1; endIdx = targetSamples;
+        elseif endIdx > N
+            endIdx = N; startIdx = N - targetSamples + 1;
+        end
+        audioIn = audioIn(startIdx:endIdx);
+    end
+    
+    % 3. Extract Features
+    features = extract(afe, audioIn);
+    testFeatures = [testFeatures; features];
+    
+    numFrames = size(features, 1);
+    testLabels = [testLabels; repmat(info.Label, numFrames, 1)];
+end
+
+% Predict
+[predictedLabels, scores] = predict(trainedModel, testFeatures);
+
+% Accuracy
+accuracy = sum(predictedLabels == testLabels) / length(testLabels) * 100;
+fprintf('<strong>Final Balanced Accuracy: %.2f%%</strong>\n', accuracy);
+
+% Confusion Matrix
+figure;
+confusionchart(testLabels, predictedLabels);
+title(['Balanced Confusion Matrix (Accuracy: ' num2str(accuracy, '%.1f') '%)']);
+
+%% 6. Save for Simulink
+% Saving as trainedModel variable which the Simulink block looks for
+save('gunshotModel.mat', 'trainedModel');
+disp('Success! Model saved as gunshotModel.mat');
